@@ -7,6 +7,7 @@
 #include <zmq.hpp>
 #include <cmath>
 #include <chrono>
+#include <filesystem>
 #include "sharpa_hand.pb.h"
 #include "ClientPlatformSpecific.hpp"
 
@@ -37,10 +38,10 @@ ClientReturnCode SDKClient::Initialize()
 	m_ZmqPubContext = std::make_shared<zmq::context_t>(1);
 	m_ZmqPublisher = std::make_shared<zmq::socket_t>(*m_ZmqPubContext, ZMQ_PUB);
 	
-	// 设置发送水位，防止内存溢出
-	int sndhwm = 10;  // 发送高水位标记
+	// Set send high water mark to prevent memory overflow
+	int sndhwm = 10;  // Send high water mark
 	m_ZmqPublisher->set(zmq::sockopt::sndhwm, sndhwm);
-	int linger = 0;   // 立即关闭
+	int linger = 0;   // Close immediately
 	m_ZmqPublisher->set(zmq::sockopt::linger, linger);
 	
 	m_ZmqPublisher->bind(m_ZmqHost);
@@ -52,21 +53,62 @@ ClientReturnCode SDKClient::Initialize()
 		return ClientReturnCode::ClientReturnCode_FailedToInitialize;
 	}
 
+
 	return ClientReturnCode::ClientReturnCode_Success;
 }
 
 ClientReturnCode SDKClient::Connect()
 {
-	ClientReturnCode t_Result;
-
-	t_Result = LookingForHosts();
-	if (t_Result != ClientReturnCode::ClientReturnCode_Success) {
-		return t_Result;
+	bool t_ConnectLocally = m_ConnectionType == ConnectionType::ConnectionType_Local;
+	SDKReturnCode t_StartResult = CoreSdk_LookForHosts(1, t_ConnectLocally);
+	if (t_StartResult != SDKReturnCode::SDKReturnCode_Success)
+	{
+		return ClientReturnCode::ClientReturnCode_FailedToFindHosts;
 	}
 
-	t_Result = ConnectingToCore();
-	if (t_Result != ClientReturnCode::ClientReturnCode_Success) { 
-		return t_Result; 
+	uint32_t t_NumberOfHostsFound = 0;
+	SDKReturnCode t_NumberResult = CoreSdk_GetNumberOfAvailableHostsFound(&t_NumberOfHostsFound);
+	if (t_NumberResult != SDKReturnCode::SDKReturnCode_Success)
+	{
+		return ClientReturnCode::ClientReturnCode_FailedToFindHosts;
+	}
+
+	if (t_NumberOfHostsFound == 0)
+	{
+		return ClientReturnCode::ClientReturnCode_FailedToFindHosts;
+	}
+
+	std::unique_ptr<ManusHost[]> t_AvailableHosts; 
+	t_AvailableHosts.reset(new ManusHost[t_NumberOfHostsFound]);
+
+	SDKReturnCode t_HostsResult = CoreSdk_GetAvailableHostsFound(t_AvailableHosts.get(), t_NumberOfHostsFound);
+	if (t_HostsResult != SDKReturnCode::SDKReturnCode_Success)
+	{
+		return ClientReturnCode::ClientReturnCode_FailedToFindHosts;
+	}
+
+	uint32_t t_HostSelection = 0;
+	if (!t_ConnectLocally && t_NumberOfHostsFound > 1)
+	{
+		ClientLog::print("Select which host you want to connect to (and press enter to submit)");
+		for (size_t i = 0; i < t_NumberOfHostsFound; i++)
+		{
+			auto t_HostInfo = t_AvailableHosts[i];
+			ClientLog::print("[{}] hostname: {} IP address: {}, version {}.{}.{}", i + 1, t_HostInfo.hostName, t_HostInfo.ipAddress, t_HostInfo.manusCoreVersion.major, t_HostInfo.manusCoreVersion.minor, t_HostInfo.manusCoreVersion.patch);
+		}
+		uint32_t t_HostSelectionInput = 0;
+		std::cin >> t_HostSelectionInput;
+		if (t_HostSelectionInput <= 0 || t_HostSelectionInput > t_NumberOfHostsFound)
+			return ClientReturnCode::ClientReturnCode_FailedToConnect;
+
+		t_HostSelection = t_HostSelectionInput - 1;
+	}
+
+	SDKReturnCode t_ConnectResult = CoreSdk_ConnectToHost(t_AvailableHosts[t_HostSelection]);
+
+	if (t_ConnectResult == SDKReturnCode::SDKReturnCode_NotConnected)
+	{
+		return ClientReturnCode::ClientReturnCode_FailedToConnect;
 	}
 
 	return ClientReturnCode::ClientReturnCode_Success;
@@ -76,15 +118,51 @@ ClientReturnCode SDKClient::Run()
 {
 	ClearConsole();
 
+	// first loop until we get a connection
+	m_ConnectionType == ConnectionType::ConnectionType_Integrated ?
+		ClientLog::print("SDK client is running in integrated mode.") :
+		ClientLog::print("SDK client is connecting to MANUS Core. (make sure it is running)");
+
 	while (Connect() != ClientReturnCode::ClientReturnCode_Success)
 	{
+		// not yet connected. wait
 		ClientLog::print("minimal client could not connect.trying again in a second.");
 		std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-	}
+	}	
 
-	while (true)
+	if (m_ConnectionType != ConnectionType::ConnectionType_Integrated)
+		ClientLog::print("SDK client is connected, setting up skeletons.");
+
+	// set the hand motion mode of the RawSkeletonStream. This is optional and can be set to any of the HandMotion enum values. Default = None
+	// None will disable hand motion tracking
+	const SDKReturnCode t_HandMotionResult = CoreSdk_SetRawSkeletonHandMotion(HandMotion_None);
+	if (t_HandMotionResult != SDKReturnCode::SDKReturnCode_Success)
+	{
+		ClientLog::error("Failed to set hand motion mode. The value returned was {}.", (int32_t)t_HandMotionResult);
+	}
+	
+	while (m_Running)
 	{
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		
+		// Check if left hand calibration needs to be loaded
+		if (!m_LeftGloveCalibrationLoaded && m_FirstLeftGloveID != UINT32_MAX)
+		{
+			LoadGloveCalibration(m_FirstLeftGloveID, "Calibration_left.mcal");
+			m_LeftGloveCalibrationLoaded = true;
+		}
+			
+		// Check if right hand calibration needs to be loaded
+		if (!m_RightGloveCalibrationLoaded && m_FirstRightGloveID != UINT32_MAX)
+		{
+			LoadGloveCalibration(m_FirstRightGloveID, "Calibration_right.mcal");
+			m_RightGloveCalibrationLoaded = true;
+		}
+		
+		if (GetKeyDown(' ')) // press space to exit
+		{
+			m_Running = false;
+		}
 	}
 	
 	return ClientReturnCode::ClientReturnCode_Success;
@@ -108,107 +186,9 @@ ClientReturnCode SDKClient::ShutDown()
 	return ClientReturnCode::ClientReturnCode_Success;
 }
 
-ClientReturnCode SDKClient::ConnectingToCore()
-{
-	SDKReturnCode t_ConnectResult = SDKReturnCode::SDKReturnCode_Error;
-	t_ConnectResult = CoreSdk_ConnectToHost(m_AvailableHosts[0]);
-
-	if (t_ConnectResult == SDKReturnCode::SDKReturnCode_NotConnected)
-	{
-		return ClientReturnCode::ClientReturnCode_Success;
-	}
-	if (t_ConnectResult != SDKReturnCode::SDKReturnCode_Success)
-	{
-		ClientLog::error("Failed to connect to Core. The error given was {}.", (int32_t)t_ConnectResult);
-		return ClientReturnCode::ClientReturnCode_FailedToConnect;
-	}
-	return ClientReturnCode::ClientReturnCode_Success;
-}
-
-ClientReturnCode SDKClient::LookingForHosts()
-{
-	ClientLog::print("Looking for hosts...");
-
-	const SDKReturnCode t_StartResult = CoreSdk_LookForHosts(m_SecondsToFindHosts, false);
-	if (t_StartResult != SDKReturnCode::SDKReturnCode_Success)
-	{
-		ClientLog::error("Failed to look for hosts. The error given was {}.", (int32_t)t_StartResult);
-		return ClientReturnCode::ClientReturnCode_FailedToFindHosts;
-	}
-
-	m_NumberOfHostsFound = 0;
-	const SDKReturnCode t_NumberResult = CoreSdk_GetNumberOfAvailableHostsFound(&m_NumberOfHostsFound);
-	if (t_NumberResult != SDKReturnCode::SDKReturnCode_Success)
-	{
-		ClientLog::error("Failed to get the number of available hosts. The error given was {}.", (int32_t)t_NumberResult);
-		return ClientReturnCode::ClientReturnCode_FailedToFindHosts;
-	}
-
-	if (m_NumberOfHostsFound == 0)
-	{
-		ClientLog::warn("No hosts found.");
-		return ClientReturnCode::ClientReturnCode_FailedToFindHosts;
-	}
-
-	m_AvailableHosts.reset(new ManusHost[m_NumberOfHostsFound]);
-	const SDKReturnCode t_HostsResult = CoreSdk_GetAvailableHostsFound(m_AvailableHosts.get(), m_NumberOfHostsFound);
-	if (t_HostsResult != SDKReturnCode::SDKReturnCode_Success)
-	{
-		ClientLog::error("Failed to get the available hosts. The error given was {}.", (int32_t)t_HostsResult);
-		return ClientReturnCode::ClientReturnCode_FailedToFindHosts;
-	}
-
-	return ClientReturnCode::ClientReturnCode_Success;
-}
-
-void SDKClient::OnConnectedCallback(const ManusHost* const p_Host)
-{
-	ClientLog::print("Connected to manus core.");
-
-	ManusVersion t_SdkVersion;
-	ManusVersion t_CoreVersion;
-	bool t_IsCompatible;
-
-	const SDKReturnCode t_Result = CoreSdk_GetVersionsAndCheckCompatibility(&t_SdkVersion, &t_CoreVersion, &t_IsCompatible);
-
-	if (t_Result == SDKReturnCode::SDKReturnCode_Success)
-	{
-		const std::string t_Versions = "Sdk version : " + std::string(t_SdkVersion.versionInfo) + ", Core version : " + std::string(t_CoreVersion.versionInfo) + ".";
-
-		if (t_IsCompatible)
-		{
-			ClientLog::print("Versions are compatible.{}", t_Versions);
-		}
-		else
-		{
-			ClientLog::warn("Versions are not compatible with each other.{}", t_Versions);
-		}
-	}
-	else
-	{
-		ClientLog::error("Failed to get the versions from the SDK. The value returned was {}.", (int32_t)t_Result);
-	}
-
-	uint32_t t_SessionId;
-	const SDKReturnCode t_SessionIdResult = CoreSdk_GetSessionId(&t_SessionId);
-	if (t_SessionIdResult == SDKReturnCode::SDKReturnCode_Success && t_SessionId != 0)
-	{
-		ClientLog::print("Session Id: {}", t_SessionId);
-	}
-	else
-	{
-		ClientLog::print("Failed to get the Session ID from Core. The value returned was{}.", (int32_t)t_SessionIdResult);
-	}
-
-	const SDKReturnCode t_HandMotionResult = CoreSdk_SetRawSkeletonHandMotion(HandMotion_None);
-	if (t_HandMotionResult != SDKReturnCode::SDKReturnCode_Success)
-	{
-		ClientLog::print("Failed to set the hand motion mode. The value returned was {}.", (int32_t)t_HandMotionResult);
-	}
-}
-
 void SDKClient::OnRawSkeletonStreamCallback(const SkeletonStreamInfo* const p_SkeletonStreamInfo)
 {	
+	// ClientLog::info("skeletonsCount: {}", p_SkeletonStreamInfo->skeletonsCount);
 	if (s_Instance)
 	{
 		ClientSkeletonCollection* t_NxtClientSkeleton = new ClientSkeletonCollection();
@@ -229,6 +209,7 @@ void SDKClient::OnRawSkeletonStreamCallback(const SkeletonStreamInfo* const p_Sk
 		stamp_msg->set_sec(sec);
 		stamp_msg->set_nanosec(nanosec);
 		header_msg->set_frame_id(id);
+		
 
 		for (uint32_t i = 0; i < p_SkeletonStreamInfo->skeletonsCount; i++)
 		{
@@ -248,10 +229,12 @@ void SDKClient::OnRawSkeletonStreamCallback(const SkeletonStreamInfo* const p_Sk
 			else{
 				continue;
 			}
-
+			// Print nodesCount
 			t_NxtClientSkeleton->skeletons[i].nodes.resize(t_NxtClientSkeleton->skeletons[i].info.nodesCount);
 			t_NxtClientSkeleton->skeletons[i].info.publishTime = p_SkeletonStreamInfo->publishTime;
 			CoreSdk_GetRawSkeletonData(i, t_NxtClientSkeleton->skeletons[i].nodes.data(), t_NxtClientSkeleton->skeletons[i].info.nodesCount);
+			// ClientLog::info("nodesCount: {}", t_NxtClientSkeleton->skeletons[i].nodes.size());
+	
 
 			if (t_NxtClientSkeleton->skeletons[i].nodes.size() > 0)
 			{
@@ -263,15 +246,19 @@ void SDKClient::OnRawSkeletonStreamCallback(const SkeletonStreamInfo* const p_Sk
 				rootRot.normalize();
 				
 				std::vector<std::pair<Eigen::Vector3f, Eigen::Quaternionf>> allPoints;
+				// Create reordered node index array
+				std::vector<int> reorderedIndices;
+				reorderedIndices = {0, 21, 22, 23, 24, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20};
 				
-				for (int j = 0; j < t_NxtClientSkeleton->skeletons[i].nodes.size(); j++)
+				for (int j = 0; j < reorderedIndices.size(); j++)
 				{
-					const auto& node = t_NxtClientSkeleton->skeletons[i].nodes[j];
+					int originalIndex = reorderedIndices[j];
+					const auto& node = t_NxtClientSkeleton->skeletons[i].nodes[originalIndex];
 					Eigen::Vector3f nodePos(node.transform.position.x, node.transform.position.y, node.transform.position.z);
 					Eigen::Quaternionf nodeRot(node.transform.rotation.w, node.transform.rotation.x, 
 											node.transform.rotation.y, node.transform.rotation.z);
 					nodeRot.normalize();
-					
+					// ClientLog::info("nodePos: {}, nodeRot: {}", nodePos.transpose(), nodeRot.coeffs().transpose());
 					Eigen::Vector3f relativePos = rootRot.inverse() * (nodePos - rootPos);
 					Eigen::Quaternionf relativeRot = rootRot.inverse()*nodeRot;
 					
@@ -282,21 +269,21 @@ void SDKClient::OnRawSkeletonStreamCallback(const SkeletonStreamInfo* const p_Sk
 					Eigen::Quaternionf rotatedRot = yRotation90 * relativeRot * yRotation90.inverse();
 					
 					// for thumb tip, rotate 45 degrees around z axis
-					if (j == 4)
-					{
-						float rotAngle = 0.0f;
-						if (t_Side == Side::Side_Left)
-						{
-							rotAngle = 45.f;
-						}
-						else if (t_Side == Side::Side_Right)
-						{
-							rotAngle = -45.f;
-						}
-						float zAngle = rotAngle * M_PI / 180.0f; 
-						Eigen::Quaternionf zRotation(cos(zAngle/2), 0, 0, sin(zAngle/2));
-						rotatedRot = rotatedRot * zRotation;
-					}
+					// if (originalIndex == 4)
+					// {
+					// 	float rotAngle = 0.0f;
+					// 	if (t_Side == Side::Side_Left)
+					// 	{
+					// 		rotAngle = 45.f;
+					// 	}
+					// 	else if (t_Side == Side::Side_Right)
+					// 	{
+					// 		rotAngle = -45.f;
+					// 	}
+					// 	float zAngle = rotAngle * M_PI / 180.0f; 
+					// 	Eigen::Quaternionf zRotation(cos(zAngle/2), 0, 0, sin(zAngle/2));
+					// 	rotatedRot = rotatedRot * zRotation;
+					// }
 					
 					allPoints.push_back(std::make_pair(rotatedPos, rotatedRot));
 				}
@@ -329,11 +316,15 @@ void SDKClient::OnRawSkeletonStreamCallback(const SkeletonStreamInfo* const p_Sk
 				auto sys_sec = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
 				auto sys_nanosec = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() % 1000000000;
 				
-				ClientLog::info("Frame[{}] skeletion: {} is published. - System time: {}.{}s", 
-					std::to_string(s_Instance->m_FrameId), 
-					t_GloveSide,
-					std::to_string(sys_sec),
-					std::to_string(sys_nanosec));
+				// Print every 100 frames
+				if (s_Instance->m_FrameId % 100 == 0)
+				{
+					ClientLog::info("Frame[{}] glove: {} is published. - System time: {}.{}s", 
+						std::to_string(s_Instance->m_FrameId), 
+						t_GloveSide,
+						std::to_string(sys_sec),
+						std::to_string(sys_nanosec));
+				}
 			}
 		}
 		
@@ -349,23 +340,23 @@ void SDKClient::OnRawSkeletonStreamCallback(const SkeletonStreamInfo* const p_Sk
 void SDKClient::OnLandscapeCallback(const Landscape* const p_Landscape)
 {
 	if (s_Instance == nullptr)return;
-	if (s_Instance->m_Landscape != nullptr) return;
-
+	// if (s_Instance->m_Landscape != nullptr) return;
 	Landscape* t_Landscape = new Landscape(*p_Landscape);
 	s_Instance->m_Landscape = t_Landscape;
 
 	for (size_t i = 0; i < s_Instance->m_Landscape->gloveDevices.gloveCount; i++)
 	{
+		// ClientLog::info("First glove id {} and side {} and glove count {}", s_Instance->m_Landscape->gloveDevices.gloves[i].id, s_Instance->m_Landscape->gloveDevices.gloves[i].side, s_Instance->m_Landscape->gloveDevices.gloveCount);
 		if (s_Instance->m_Landscape->gloveDevices.gloves[i].side == Side::Side_Left)
 		{
 			s_Instance->m_FirstLeftGloveID = s_Instance->m_Landscape->gloveDevices.gloves[i].id;
-			ClientLog::info("First left glove ID: {}", s_Instance->m_FirstLeftGloveID);
+			// ClientLog::info("First left glove ID: {}", s_Instance->m_FirstLeftGloveID);
 			continue;
 		}
 		if (s_Instance->m_Landscape->gloveDevices.gloves[i].side == Side::Side_Right)
 		{
 			s_Instance->m_FirstRightGloveID = s_Instance->m_Landscape->gloveDevices.gloves[i].id;
-			ClientLog::info("First right glove ID: {}", s_Instance->m_FirstRightGloveID);
+			// ClientLog::info("First right glove ID: {}", s_Instance->m_FirstRightGloveID);
 			continue;
 		}
 	}
@@ -373,13 +364,9 @@ void SDKClient::OnLandscapeCallback(const Landscape* const p_Landscape)
 
 ClientReturnCode SDKClient::RegisterAllCallbacks()
 {
-	const SDKReturnCode t_RegisterConnectCallbackResult = CoreSdk_RegisterCallbackForOnConnect(*OnConnectedCallback);
-	if (t_RegisterConnectCallbackResult != SDKReturnCode::SDKReturnCode_Success)
-	{
-		ClientLog::error("Failed to register callback function for after connecting to Manus Core. The value returned was {}.", (int32_t)t_RegisterConnectCallbackResult);
-		return ClientReturnCode::ClientReturnCode_FailedToInitialize;
-	}
-
+	// Register the callback to receive Raw Skeleton data
+	// it is optional, but without it you can not see any resulting skeleton data.
+	// see OnRawSkeletonStreamCallback for more details.
 	const SDKReturnCode t_RegisterSkeletonCallbackResult = CoreSdk_RegisterCallbackForRawSkeletonStream(*OnRawSkeletonStreamCallback);
 	if (t_RegisterSkeletonCallbackResult != SDKReturnCode::SDKReturnCode_Success)
 	{
@@ -387,6 +374,7 @@ ClientReturnCode SDKClient::RegisterAllCallbacks()
 		return ClientReturnCode::ClientReturnCode_FailedToInitialize;
 	}
 
+	// Register the callback to receive Landscape data
 	const SDKReturnCode t_RegisterLandscapeCallbackResult = CoreSdk_RegisterCallbackForLandscapeStream(*OnLandscapeCallback);
 	if (t_RegisterLandscapeCallbackResult != SDKReturnCode::SDKReturnCode_Success)
 	{
@@ -399,9 +387,19 @@ ClientReturnCode SDKClient::RegisterAllCallbacks()
 
 ClientReturnCode SDKClient::InitializeSDK()
 {
+	// Use Integrated mode directly, no user input required
+	m_ConnectionType = ConnectionType::ConnectionType_Integrated;
 
+	// before we can use the SDK, some internal SDK bits need to be initialized.
 	SDKReturnCode t_InitializeResult;
-	t_InitializeResult = CoreSdk_InitializeCore();
+	if (m_ConnectionType == ConnectionType::ConnectionType_Integrated)
+	{
+		t_InitializeResult = CoreSdk_InitializeIntegrated();
+	}
+	else
+	{
+		t_InitializeResult = CoreSdk_InitializeCore();
+	}
 
 	if (t_InitializeResult != SDKReturnCode::SDKReturnCode_Success)
 	{
@@ -427,12 +425,74 @@ ClientReturnCode SDKClient::InitializeSDK()
 
 	if (t_CoordinateResult != SDKReturnCode::SDKReturnCode_Success)
 	{
-		ClientLog::error("Failed to initialize the Manus Core SDK coordinate system. The value returned was {}.", (int32_t)t_InitializeResult);
+		ClientLog::error("Failed to initialize the Manus Core SDK coordinate system. The value returned was {}.", (int32_t)t_CoordinateResult);
 		return ClientReturnCode::ClientReturnCode_FailedToInitialize;
 	}
 
 	return ClientReturnCode::ClientReturnCode_Success;
 }
+
+void SDKClient::LoadGloveCalibration(uint32_t p_GloveId, const std::string& p_CalibrationFileName)
+{
+	// Get current working directory
+	std::string t_CurrentDirectory = std::filesystem::current_path().string();
+	
+	// Build full path to calibration file
+	std::string t_CalibrationFilePath = t_CurrentDirectory + s_SlashForFilesystemPath + p_CalibrationFileName;
+	
+	// Check if file exists
+	if (!DoesFolderOrFileExist(t_CalibrationFilePath))
+	{
+		ClientLog::warn("Calibration file does not exist: {}", t_CalibrationFilePath);
+		return;
+	}
+	
+	// Read file
+	std::ifstream t_File = GetInputFileStream(t_CalibrationFilePath);
+	if (!t_File)
+	{
+		ClientLog::warn("Unable to open calibration file: {}", t_CalibrationFilePath);
+		return;
+	}
+	
+	// Get file size
+	t_File.seekg(0, t_File.end);
+	int t_FileLength = (int)t_File.tellg();
+	t_File.seekg(0, t_File.beg);
+	
+	if (t_FileLength <= 0)
+	{
+		ClientLog::warn("Calibration file is empty: {}", t_CalibrationFilePath);
+		t_File.close();
+		return;
+	}
+	
+	// Read calibration data
+	unsigned char* t_CalibrationData = new unsigned char[t_FileLength];
+	t_File.read((char*)t_CalibrationData, t_FileLength);
+	t_File.close();
+	
+	// Set glove calibration
+	SetGloveCalibrationReturnCode t_Result;
+	SDKReturnCode t_SetResult = CoreSdk_SetGloveCalibration(p_GloveId, t_CalibrationData, t_FileLength, &t_Result);
+	
+	// Clean up memory
+	delete[] t_CalibrationData;
+	
+	// Print result
+	if (t_SetResult == SDKReturnCode::SDKReturnCode_Success)
+	{
+		ClientLog::info("Successfully loaded glove calibration file: {} (Glove ID: {})", p_CalibrationFileName, p_GloveId);
+		ClientLog::info("Calibration setting result: {}", (int)t_Result);
+	}
+	else
+	{
+		ClientLog::error("Failed to load glove calibration file: {} (Glove ID: {}), SDK return code: {}", 
+			p_CalibrationFileName, p_GloveId, (int)t_SetResult);
+	}
+}
+
+
 
 int main(int argc, char* argv[])
 {

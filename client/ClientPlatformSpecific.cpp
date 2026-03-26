@@ -147,6 +147,19 @@ static bool InitializeNcurses(void)
 		return false;
 	}
 
+	// 添加设置以保留历史记录和避免窗口大小影响
+	// 禁用滚动功能，让输出直接到终端
+	scrollok(stdscr, FALSE);
+	
+	// 设置为不使用替代屏幕缓冲区，这样历史记录会保留
+	// 这个需要在initscr之前设置，但我们可以通过环境变量来控制
+	// 或者直接退出ncurses模式进行普通输出
+	endwin();
+	
+	// 重新初始化，但这次不使用全屏模式
+	// 我们只需要输入功能，输出使用标准方式
+	newterm(NULL, stdout, stdin);
+
 	return true;
 }
 
@@ -490,12 +503,15 @@ void SDKClientPlatformSpecific::ApplyConsolePosition(
 	// Move the cursor to row 1 column 1.
 	//printf("\e[1;1H\n");
 
+	// 注释掉clear()调用以保留历史输出，避免清屏
+	/*
 	if (clear() != OK)
 	{
 		ClientLog::error("Failed to clear the screen.");
 	}
 
 	refresh();
+	*/
 }
 
 bool SDKClientPlatformSpecific::GetKey(const int p_Key)
