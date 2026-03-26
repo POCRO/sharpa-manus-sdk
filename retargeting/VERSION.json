@@ -1,0 +1,11 @@
+{
+  "version": "V3.2",
+  "build_date": "2025-11-12 17:34:47",
+  "build_user": "sharpa@DLG050605",
+  "python_version": "Python 3.10.18",
+  "platform": "Linux-x86_64",
+  "files": [
+    "hand_kinematic_casadi.so",
+    "hand_retargeting_optimizer.so"
+  ]
+}
